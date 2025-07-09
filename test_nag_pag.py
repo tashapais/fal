@@ -13,7 +13,7 @@ import io
 # Test configuration
 TEST_PROMPT = "A serene mountain landscape with a crystal clear lake, golden hour lighting"
 TEST_IMAGE_URL = "https://picsum.photos/512/512"  # Random test image
-BASE_URL = "http://localhost:8000"  # Adjust based on your deployment
+BASE_URL = "https://fal.run/tashapais/flux-nag-pag-app"  # Use the deployed endpoint
 
 def test_text_to_image():
     """Test text-to-image generation with NAG-PAG"""
@@ -207,17 +207,7 @@ def main():
     print("🚀 Starting NAG-PAG FLUX.1 [dev] Tests")
     print("=" * 50)
     
-    # Check if server is running
-    try:
-        response = requests.get(f"{BASE_URL}/health", timeout=5)
-        if response.status_code != 200:
-            print(f"❌ Server health check failed. Is the app running at {BASE_URL}?")
-            return
-    except requests.exceptions.RequestException:
-        print(f"❌ Cannot connect to server at {BASE_URL}. Is the app running?")
-        return
-    
-    print("✅ Server is running!")
+    print("🌐 Testing against deployed fal endpoint...")
     
     # Run tests
     test_text_to_image()

@@ -24,7 +24,7 @@ class TextToImageInput(BaseModel):
     seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
     nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale")
     nag_pag_applied_layers: List[str] = Field(
-        default=["transformer_blocks.8.attn", "transformer_blocks.12.attn", "transformer_blocks.16.attn"],
+        default=["transformer_blocks.8", "transformer_blocks.12", "transformer_blocks.16"],
         description="Layers to apply NAG-PAG guidance to"
     )
 
@@ -43,7 +43,7 @@ class ImageToImageInput(BaseModel):
     seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
     nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale")
     nag_pag_applied_layers: List[str] = Field(
-        default=["transformer_blocks.8.attn", "transformer_blocks.12.attn", "transformer_blocks.16.attn"],
+        default=["transformer_blocks.8", "transformer_blocks.12", "transformer_blocks.16"],
         description="Layers to apply NAG-PAG guidance to"
     )
 
@@ -67,7 +67,22 @@ class NAGPAGProcessor:
             
         # Apply NAG-PAG guidance to attention computation
         try:
-            hidden_states = input[0]
+            # Handle different input structures - for attention modules, input is typically a tuple
+            if isinstance(input, tuple):
+                if len(input) > 0:
+                    hidden_states = input[0]
+                    # Validate that we got a tensor
+                    if not isinstance(hidden_states, torch.Tensor):
+                        print(f"⚠️ First element of tuple is not a tensor: {type(hidden_states)}")
+                        return output
+                else:
+                    # Empty tuple inputs can happen during model initialization - just pass through
+                    return output
+            elif isinstance(input, torch.Tensor):
+                hidden_states = input
+            else:
+                print(f"⚠️ Unexpected input type: {type(input)}")
+                return output
             
             # Get Q, K, V projections
             q = module.to_q(hidden_states)
@@ -77,10 +92,16 @@ class NAGPAGProcessor:
             # Apply NAG-PAG guidance
             guided_output = self.apply_nag_pag_guidance(output, q, k, v, hidden_states)
             
+            # Validate guidance succeeded
+            if guided_output is None or (hasattr(guided_output, 'shape') and guided_output.shape != output.shape):
+                print(f"⚠️ NAG-PAG guidance failed shape validation, using original output")
+                return output
+            
             return guided_output
             
         except Exception as e:
             print(f"⚠️ NAG-PAG guidance failed, using original output: {e}")
+            print(f"⚠️ Input type: {type(input)}, Input length: {len(input) if hasattr(input, '__len__') else 'N/A'}")
             return output
     
     def apply_nag_pag_guidance(self, original_attn_output, q, k, v, input_tensor):
@@ -91,17 +112,39 @@ class NAGPAGProcessor:
         3. Extrapolate and normalize features (like NAG)
         """
         try:
+            # Validate input shapes
+            if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+                print(f"⚠️ Unexpected tensor dimensions: q={q.shape}, k={k.shape}, v={v.shape}")
+                return original_attn_output
+                
             batch_size, seq_len, embed_dim = q.shape
+            
+            # Validate that all tensors have the same shape
+            if k.shape != q.shape or v.shape != q.shape:
+                print(f"⚠️ Tensor shape mismatch: q={q.shape}, k={k.shape}, v={v.shape}")
+                return original_attn_output
             
             # Infer number of heads from the architecture
             # For FLUX, we need to check the actual dimensions
-            if embed_dim % 64 == 0:
-                num_heads = embed_dim // 64
-            else:
-                # Fallback to common configurations
-                num_heads = max(8, embed_dim // 128)
+            possible_head_dims = [64, 128, 256, 512]
+            num_heads = None
+            head_dim = None
             
-            head_dim = embed_dim // num_heads
+            for hd in possible_head_dims:
+                if embed_dim % hd == 0:
+                    num_heads = embed_dim // hd
+                    head_dim = hd
+                    break
+            
+            # Fallback calculation
+            if num_heads is None:
+                num_heads = max(8, embed_dim // 128)
+                head_dim = embed_dim // num_heads
+            
+            # Ensure head_dim is valid
+            if head_dim <= 0 or num_heads <= 0:
+                print(f"⚠️ Invalid head configuration: num_heads={num_heads}, head_dim={head_dim}")
+                return original_attn_output
             
             # Reshape for multi-head attention
             q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
@@ -147,6 +190,7 @@ class NAGPAGProcessor:
             
         except Exception as e:
             print(f"⚠️ NAG-PAG guidance computation failed: {e}")
+            print(f"⚠️ Debug info: q.shape={q.shape if 'q' in locals() else 'N/A'}, batch_size={batch_size if 'batch_size' in locals() else 'N/A'}")
             # Return original attention output as fallback
             return original_attn_output
 
@@ -241,61 +285,87 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
         
         transformer = pipe.transformer
         
+        print(f"🔍 Setting up NAG-PAG hooks for {len(applied_layers)} layers...")
+        
         for layer_name in applied_layers:
             try:
                 # Navigate to the specified layer
                 layer_parts = layer_name.split('.')
                 module = transformer
-                for part in layer_parts:
+                for i, part in enumerate(layer_parts):
                     if part.isdigit():
                         module = module[int(part)]
                     else:
                         module = getattr(module, part)
+                    print(f"  └─ {'.'.join(layer_parts[:i+1])}: {type(module).__name__}")
                 
-                # Add module name for tracking
-                module._module_name = layer_name
-                
-                # Hook the attention module
-                hook = module.register_forward_hook(processor.hook_attention_forward)
-                hooks.append(hook)
-                
-                print(f"✅ Applied NAG-PAG hook to {layer_name}")
+                # Verify this is an attention module
+                if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
+                    # Add module name for tracking
+                    module._module_name = layer_name
+                    
+                    # Hook the attention module
+                    hook = module.register_forward_hook(processor.hook_attention_forward)
+                    hooks.append(hook)
+                    
+                    print(f"✅ Applied NAG-PAG hook to {layer_name}")
+                else:
+                    print(f"⚠️ Module {layer_name} is not a valid attention module")
+                    # Try to find attention submodules
+                    for attr_name in dir(module):
+                        if 'attn' in attr_name.lower():
+                            sub_module = getattr(module, attr_name)
+                            if hasattr(sub_module, 'to_q') and hasattr(sub_module, 'to_k') and hasattr(sub_module, 'to_v'):
+                                sub_module._module_name = f"{layer_name}.{attr_name}"
+                                hook = sub_module.register_forward_hook(processor.hook_attention_forward)
+                                hooks.append(hook)
+                                print(f"✅ Applied NAG-PAG hook to {layer_name}.{attr_name}")
+                                break
                 
             except Exception as e:
                 print(f"⚠️ Could not apply NAG-PAG hook to {layer_name}: {e}")
-                # Try alternative layer names for FLUX
-                try:
-                    # Try different possible attention module names
-                    alternative_names = [
-                        layer_name.replace(".attn", ".attention"),
-                        layer_name.replace(".attn", ".self_attn"),
-                        layer_name.replace(".attn", ".multi_head_attn"),
-                        layer_name.replace("transformer_blocks", "layers"),
-                        layer_name.replace("transformer_blocks", "blocks"),
-                    ]
-                    
-                    for alt_name in alternative_names:
-                        try:
-                            alt_parts = alt_name.split('.')
-                            alt_module = transformer
-                            for part in alt_parts:
-                                if part.isdigit():
-                                    alt_module = alt_module[int(part)]
-                                else:
-                                    alt_module = getattr(alt_module, part)
-                            
-                            alt_module._module_name = alt_name
-                            hook = alt_module.register_forward_hook(processor.hook_attention_forward)
-                            hooks.append(hook)
-                            print(f"✅ Applied NAG-PAG hook to alternative {alt_name}")
-                            break
-                        except:
-                            continue
-                            
-                except Exception as e2:
-                    print(f"⚠️ Could not find alternative for {layer_name}: {e2}")
+                # Try to find any attention modules in the transformer
+                print(f"🔍 Searching for attention modules in transformer...")
+                self.find_attention_modules(transformer)
+                
+        if len(hooks) == 0:
+            print("⚠️ No NAG-PAG hooks were applied. Falling back to automatic detection...")
+            hooks = self.auto_detect_and_hook_attention(transformer, processor)
                 
         return hooks, processor
+    
+    def find_attention_modules(self, module, path="", max_depth=4):
+        """Find all attention modules in the transformer"""
+        if max_depth <= 0:
+            return
+            
+        # Check if current module is an attention module
+        if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
+            print(f"🔍 Found attention module: {path}")
+            
+        # Recursively search children
+        for name, child in module.named_children():
+            child_path = f"{path}.{name}" if path else name
+            self.find_attention_modules(child, child_path, max_depth - 1)
+    
+    def auto_detect_and_hook_attention(self, transformer, processor):
+        """Automatically detect and hook attention modules"""
+        hooks = []
+        
+        def hook_attention_recursive(module, path=""):
+            if hasattr(module, 'to_q') and hasattr(module, 'to_k') and hasattr(module, 'to_v'):
+                module._module_name = path
+                hook = module.register_forward_hook(processor.hook_attention_forward)
+                hooks.append(hook)
+                print(f"✅ Auto-hooked attention module: {path}")
+                
+            for name, child in module.named_children():
+                child_path = f"{path}.{name}" if path else name
+                hook_attention_recursive(child, child_path)
+        
+        hook_attention_recursive(transformer)
+        print(f"🔍 Auto-detected and hooked {len(hooks)} attention modules")
+        return hooks
     
     def debug_transformer_structure(self, transformer, max_depth=3):
         """Debug function to inspect transformer structure"""
@@ -375,9 +445,12 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                     pil_image.save(tmp_file.name, format="PNG")
                     temp_path = tmp_file.name
 
-                # Convert to fal Image
+                # Convert to fal Image and verify
                 fal_image = Image.from_path(temp_path)
                 print(f"✅ NAG-PAG guided Fal Image created")
+                print(f"🔗 Image URL: {getattr(fal_image, 'url', 'NO URL')}")
+                print(f"📄 Image content_type: {getattr(fal_image, 'content_type', 'NO CONTENT_TYPE')}")
+                print(f"📁 Image file_name: {getattr(fal_image, 'file_name', 'NO FILE_NAME')}")
 
                 # Clean up
                 try:
@@ -451,9 +524,12 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                         pil_image.save(tmp_file.name, format="PNG")
                         temp_path = tmp_file.name
 
-                    # Convert to fal Image
+                    # Convert to fal Image and verify
                     fal_image = Image.from_path(temp_path)
                     print(f"✅ NAG-PAG guided Fal Image created")
+                    print(f"🔗 Image URL: {getattr(fal_image, 'url', 'NO URL')}")
+                    print(f"📄 Image content_type: {getattr(fal_image, 'content_type', 'NO CONTENT_TYPE')}")
+                    print(f"📁 Image file_name: {getattr(fal_image, 'file_name', 'NO FILE_NAME')}")
 
                     # Clean up
                     try:
