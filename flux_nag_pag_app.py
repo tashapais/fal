@@ -22,11 +22,18 @@ class TextToImageInput(BaseModel):
     num_inference_steps: int = Field(default=20, description="Number of inference steps")
     guidance_scale: float = Field(default=3.5, description="Guidance scale for generation")
     seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
-    nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale")
+    enable_nag_pag: bool = Field(default=True, description="Enable NAG-PAG guidance (set to False for baseline comparison)")
+    nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale (only used if enable_nag_pag=True)")
     nag_pag_applied_layers: List[str] = Field(
-        default=["transformer_blocks.8", "transformer_blocks.12", "transformer_blocks.16"],
+        default=["transformer_blocks.8.attn", "transformer_blocks.12.attn", "transformer_blocks.16.attn"],
         description="Layers to apply NAG-PAG guidance to"
     )
+
+
+class TextToImageOutput(BaseModel):
+    image: Image = Field(description="Generated image")
+    seed: int = Field(description="Seed used for generation")
+    has_nag_pag: bool = Field(description="Whether NAG-PAG guidance was applied")
 
 
 class ImageToImageInput(BaseModel):
@@ -41,11 +48,18 @@ class ImageToImageInput(BaseModel):
     num_inference_steps: int = Field(default=20, description="Number of inference steps")
     guidance_scale: float = Field(default=3.5, description="Guidance scale for generation")
     seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
-    nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale")
+    enable_nag_pag: bool = Field(default=True, description="Enable NAG-PAG guidance (set to False for baseline comparison)")
+    nag_pag_scale: float = Field(default=3.0, description="NAG-PAG guidance scale (only used if enable_nag_pag=True)")
     nag_pag_applied_layers: List[str] = Field(
-        default=["transformer_blocks.8", "transformer_blocks.12", "transformer_blocks.16"],
+        default=["transformer_blocks.8.attn", "transformer_blocks.12.attn", "transformer_blocks.16.attn"],
         description="Layers to apply NAG-PAG guidance to"
     )
+
+
+class ImageToImageOutput(BaseModel):
+    image: Image = Field(description="Transformed image")
+    seed: int = Field(description="Seed used for generation")
+    has_nag_pag: bool = Field(description="Whether NAG-PAG guidance was applied")
 
 
 class NAGPAGProcessor:
@@ -401,7 +415,7 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
             print(f"⚠️ NAG-PAG text-to-image warmup failed: {str(e)}")
 
     @fal.endpoint("/text-to-image")
-    def text_to_image(self, request: TextToImageInput) -> Image:
+    def text_to_image(self, request: TextToImageInput) -> TextToImageOutput:
         try:
             import torch
             import random
@@ -409,22 +423,26 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
             import os
             import math
 
-            print(f"🎯 Generating image with NAG-PAG guidance: {request.prompt[:50]}...")
-            print(f"🔧 NAG-PAG scale: {request.nag_pag_scale}, Applied layers: {request.nag_pag_applied_layers}")
-
             # Generate or use provided seed
             seed = request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
             generator = torch.Generator("cuda").manual_seed(seed)
 
-            # Setup NAG-PAG hooks
-            hooks, processor = self.setup_nag_pag_hooks(
-                self.pipe, 
-                request.nag_pag_scale, 
-                request.nag_pag_applied_layers
-            )
+            # Setup NAG-PAG hooks if enabled
+            hooks = []
+            processor = None
+            if request.enable_nag_pag:
+                print(f"🎯 Generating image with NAG-PAG guidance: {request.prompt[:50]}...")
+                print(f"🔧 NAG-PAG scale: {request.nag_pag_scale}, Applied layers: {request.nag_pag_applied_layers}")
+                hooks, processor = self.setup_nag_pag_hooks(
+                    self.pipe, 
+                    request.nag_pag_scale, 
+                    request.nag_pag_applied_layers
+                )
+            else:
+                print(f"🎯 Generating baseline image (no NAG-PAG): {request.prompt[:50]}...")
 
             try:
-                # Generate image with NAG-PAG guidance
+                # Generate image
                 result = self.pipe(
                     prompt=request.prompt,
                     height=request.height,
@@ -434,7 +452,8 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                     generator=generator,
                 )
 
-                print("🖼️ NAG-PAG guided image generated successfully")
+                guidance_type = "NAG-PAG guided" if request.enable_nag_pag else "baseline"
+                print(f"🖼️ {guidance_type} image generated successfully")
 
                 # Get the PIL image
                 pil_image = result.images[0]
@@ -445,20 +464,22 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                     pil_image.save(tmp_file.name, format="PNG")
                     temp_path = tmp_file.name
 
-                # Convert to fal Image and verify
+                # Convert to fal Image
                 fal_image = Image.from_path(temp_path)
-                print(f"✅ NAG-PAG guided Fal Image created")
-                print(f"🔗 Image URL: {getattr(fal_image, 'url', 'NO URL')}")
-                print(f"📄 Image content_type: {getattr(fal_image, 'content_type', 'NO CONTENT_TYPE')}")
-                print(f"📁 Image file_name: {getattr(fal_image, 'file_name', 'NO FILE_NAME')}")
+                print(f"✅ {guidance_type} Fal Image created")
 
-                # Clean up
+                # Clean up temporary file
                 try:
                     os.unlink(temp_path)
                 except:
                     pass
 
-                return fal_image
+                # Return structured output according to fal conventions
+                return TextToImageOutput(
+                    image=fal_image,
+                    seed=seed,
+                    has_nag_pag=request.enable_nag_pag
+                )
 
             finally:
                 # Clean up hooks
@@ -472,16 +493,13 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
             raise ValueError(f"NAG-PAG text-to-image generation failed: {str(e)}")
 
     @fal.endpoint("/image-to-image")
-    def image_to_image(self, request: ImageToImageInput) -> Image:
+    def image_to_image(self, request: ImageToImageInput) -> ImageToImageOutput:
         try:
             import torch
             import random
             import tempfile
             import os
             import math
-
-            print(f"🎯 Transforming image with NAG-PAG guidance: {request.prompt[:50]}...")
-            print(f"🔧 NAG-PAG scale: {request.nag_pag_scale}, Applied layers: {request.nag_pag_applied_layers}")
 
             # Download and load the input image
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -493,15 +511,22 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                 seed = request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
                 generator = torch.Generator("cuda").manual_seed(seed)
 
-                # Setup NAG-PAG hooks
-                hooks, processor = self.setup_nag_pag_hooks(
-                    self.img2img_pipe,
-                    request.nag_pag_scale,
-                    request.nag_pag_applied_layers
-                )
+                # Setup NAG-PAG hooks if enabled
+                hooks = []
+                processor = None
+                if request.enable_nag_pag:
+                    print(f"🎯 Transforming image with NAG-PAG guidance: {request.prompt[:50]}...")
+                    print(f"🔧 NAG-PAG scale: {request.nag_pag_scale}, Applied layers: {request.nag_pag_applied_layers}")
+                    hooks, processor = self.setup_nag_pag_hooks(
+                        self.img2img_pipe,
+                        request.nag_pag_scale,
+                        request.nag_pag_applied_layers
+                    )
+                else:
+                    print(f"🎯 Transforming image (baseline, no NAG-PAG): {request.prompt[:50]}...")
 
                 try:
-                    # Generate image with NAG-PAG guidance
+                    # Generate image transformation
                     result = self.img2img_pipe(
                         prompt=request.prompt,
                         image=input_image,
@@ -513,7 +538,8 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                         generator=generator,
                     )
 
-                    print("🖼️ NAG-PAG guided image transformation completed")
+                    guidance_type = "NAG-PAG guided" if request.enable_nag_pag else "baseline"
+                    print(f"🖼️ {guidance_type} image transformation completed")
 
                     # Get the PIL image
                     pil_image = result.images[0]
@@ -524,20 +550,22 @@ class FluxNAGPAGApp(fal.App, keep_alive=300, name="flux-nag-pag-app"):
                         pil_image.save(tmp_file.name, format="PNG")
                         temp_path = tmp_file.name
 
-                    # Convert to fal Image and verify
+                    # Convert to fal Image
                     fal_image = Image.from_path(temp_path)
-                    print(f"✅ NAG-PAG guided Fal Image created")
-                    print(f"🔗 Image URL: {getattr(fal_image, 'url', 'NO URL')}")
-                    print(f"📄 Image content_type: {getattr(fal_image, 'content_type', 'NO CONTENT_TYPE')}")
-                    print(f"📁 Image file_name: {getattr(fal_image, 'file_name', 'NO FILE_NAME')}")
+                    print(f"✅ {guidance_type} Fal Image created")
 
-                    # Clean up
+                    # Clean up temporary file
                     try:
                         os.unlink(temp_path)
                     except:
                         pass
 
-                    return fal_image
+                    # Return structured output according to fal conventions
+                    return ImageToImageOutput(
+                        image=fal_image,
+                        seed=seed,
+                        has_nag_pag=request.enable_nag_pag
+                    )
 
                 finally:
                     # Clean up hooks
